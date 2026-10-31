@@ -1,5 +1,5 @@
 /**
- * OpenCode server plugin which captures raw LLM HTTP payloads to `~/opencode-trace`.
+ * OpenCode server plugin which captures raw LLM payloads to `~/opencode-trace`.
  *
  * Each trace is an interactive html file whose trailing unterminated html-comment contains
  * one json object per line. To read the logs programmatically, strip everything up to that
@@ -12,6 +12,7 @@ import { appendFileSync, existsSync, mkdirSync, readFileSync } from "node:fs"
 import { createHash } from "node:crypto"
 import os from "node:os"
 import path from "node:path"
+import * as zlib from "node:zlib"
 
 const root = path.join(os.homedir(), "opencode-trace")
 const PREAMBLE = `<!DOCTYPE html>
@@ -519,14 +520,44 @@ function responseAsJson(text: string, url: string): Record<string, unknown> {
   }
 }
 
-/**
- * Intercepts matching OpenCode LLM fetches and logs request/response rows.
- * Side effects: mutates `prevs`, mutates `ids`, and writes logs to disk.
- */
-async function tracedFetch(
-  input: Parameters<typeof globalThis.fetch>[0],
-  init?: Parameters<typeof globalThis.fetch>[1],
-): Promise<Response> {
+/** Request-scoped callbacks shared by V1's fetch wrapper and V2's transport hooks. */
+interface Trace {
+  json: (responseNext: object) => void
+  error: (err: unknown) => void
+}
+
+function requestAsJson(text: string): Record<string, unknown> {
+  try {
+    const body = JSON.parse(text) as unknown
+    return isRecord(body) ? body : { _body: text }
+  } catch {
+    return { _body: text }
+  }
+}
+
+/** V2 may compress native HTTP requests. Decode only our copy, retaining bytes on failure. */
+async function readRequest(req: Request): Promise<Record<string, unknown>> {
+  let body: Buffer
+  try {
+    body = Buffer.from(await req.clone().arrayBuffer())
+  } catch {
+    return { _body: "", _error: "Unable to read request body" }
+  }
+  const encoding = req.headers.get("content-encoding")?.toLowerCase()
+  if (!encoding || encoding === "identity") return requestAsJson(body.toString("utf8"))
+  try {
+    // zstd is available in V2's Node runtime, but not in every V1 runtime or our Node 22 typings.
+    const zstd = (zlib as typeof zlib & { zstdDecompressSync?: typeof zlib.gunzipSync }).zstdDecompressSync
+    if (encoding === "zstd" && zstd) return requestAsJson(zstd(body).toString("utf8"))
+    if (encoding === "gzip") return requestAsJson(zlib.gunzipSync(body).toString("utf8"))
+  } catch {
+    // Preserve the original compressed payload if it cannot be decoded.
+  }
+  return { _body: body.toString("base64"), _body_encoding: "base64", _content_encoding: encoding }
+}
+
+/** Starts a request/response trace; V2 supplies its request kind instead of inferring it. */
+function startTrace(req: Pick<Request, "method" | "url">, session: string, raw: Record<string, unknown>, kind?: string): Trace {
   const now = (): string => new Date().toISOString()
   const error = (err: unknown): { _error: string; _stack?: string } =>
     err instanceof Error
@@ -535,21 +566,10 @@ async function tracedFetch(
         : { _error: err.message, _stack: err.stack }
       : { _error: String(err) }
 
-  const req = new Request(input, init)
-  const session = req.headers.get("x-opencode-session") ?? req.headers.get("x-session-affinity") ?? req.headers.get("session_id") ?? undefined;
-  if (session === undefined) return orig!(req);
-
-  const text = await req.clone().text().catch(() => "")
-  const raw = ((): Record<string, unknown> => {
-    try {
-      const body = JSON.parse(text) as unknown
-      return isRecord(body) ? body : { _body: text }
-    } catch {
-      return { _body: text }
-    }
-  })()
   const title = isRecord(raw) && typeof raw._body !== "string" ? extractPromptFromRequestBody(raw) : undefined
-  const purpose = isRecord(raw) && Array.isArray(raw.tools) && raw.tools.length > 0 ? '' : '[meta]';
+  const purpose = kind === undefined
+    ? isRecord(raw) && Array.isArray(raw.tools) && raw.tools.length > 0 ? '' : '[meta]'
+    : kind === "primary" ? "" : `[${kind}]`
   // The purpose field is "[meta]" for LLM requests that appear to be not part of the conversation, e.g. "generate a title".
   // I tried a bunch of heuristics, and this one "no tools" was the one that worked best across a variety of models.
   // We calculate it here based on the request, and store it on both request and response, since otherwise
@@ -576,19 +596,56 @@ async function tracedFetch(
     _ts: now(),
   })
 
-  const res = await orig!(req).catch((err) => {
+  const responseJson = (responseNext: object): void => {
+    const responseKey = `${session}\n${req.method}\n${req.url}\nresponse\n${purpose}`
+    const [responseRow] = delta(prevs.get(responseKey), responseNext)
+    prevs.set(responseKey, responseNext)
+    writeNoThrow(session, name, {
+      ...(responseRow as Record<string, unknown>),
+      ...common,
+      _kind: "response",
+      _ts: now(),
+    })
+  }
+  const fail = (err: unknown): void => {
     writeNoThrow(session, name, {
       ...common,
       _kind: "error",
       _ts: now(),
       ...error(err),
     })
+  }
+
+  return { json: responseJson, error: fail }
+}
+
+/**
+ * Intercepts matching OpenCode LLM fetches and logs request/response rows.
+ * Side effects: mutates `prevs`, mutates `ids`, and writes logs to disk.
+ */
+async function tracedFetch(
+  input: Parameters<typeof globalThis.fetch>[0],
+  init?: Parameters<typeof globalThis.fetch>[1],
+): Promise<Response> {
+  const req = new Request(input, init)
+  const session = req.headers.get("x-opencode-session") ?? req.headers.get("x-session-affinity") ?? req.headers.get("session_id") ?? undefined;
+  if (session === undefined) return orig!(req);
+
+  const raw = await readRequest(req)
+  const trace = startTrace(req, session, raw)
+  const res = await orig!(req).catch((err: unknown) => {
+    trace.error(err)
     throw err
-  });
+  })
   // We'll register background processing of the response, once it comes. But return 'res' immediately.
-  void res
-    .clone()
-    .text()
+  traceResponse(req, res, trace)
+  return res
+}
+
+function traceResponse(req: Request, res: Response, trace: Trace): void {
+  // Clone synchronously; the async function also turns clone failures into rejections.
+  const read = async (): Promise<string> => res.clone().text()
+  void read()
     .then((body) => {
       const json = responseAsJson(body, req.url)
       const detail = isRecord(json) && isRecord(json.error) && typeof json.error.message === "string"
@@ -599,37 +656,129 @@ async function tracedFetch(
       const responseNext = (!res.ok
         ? { ...json, _status: res.status, _status_text: res.statusText, _error: detail }
         : json) as object
-      const responseKey = `${session}\n${req.method}\n${req.url}\nresponse\n${purpose}`
-      const [responseRow] = delta(prevs.get(responseKey), responseNext)
-      prevs.set(responseKey, responseNext)
-      writeNoThrow(session, name, {
-        ...(responseRow as Record<string, unknown>),
-        ...common,
-        _kind: "response",
-        _ts: now(),
-      })
+      trace.json(responseNext)
     })
-    .catch((err) => {
-      writeNoThrow(session, name, {
-        ...common,
+    .catch(trace.error)
+}
+
+/** The V2 API subset used here (OpenCode 2.1.4), without an SDK dependency just for types. */
+interface TraceRequest {
+  readonly sessionID: string
+  readonly kind: "primary" | "compaction" | "title" | "generate"
+}
+interface TraceHooks {
+  "http.request": TraceRequest & { request: Request }
+  "http.response": TraceRequest & { readonly request: Request; response: Response }
+  "experimental.ws.handshake": TraceRequest & { url: string }
+  "experimental.ws.send": TraceRequest & { frame: string }
+  "experimental.ws.receive": TraceRequest & { frame: string }
+  retry: { readonly sessionID: string; readonly error: { readonly message: string }; readonly attempt: number }
+}
+interface TraceContext {
+  session: {
+    hook<K extends keyof TraceHooks>(name: K, callback: (event: TraceHooks[K]) => void | Promise<void>): Promise<unknown>
+  }
+  event: {
+    subscribe(options: { signal: AbortSignal }): AsyncIterable<{ type: string; data: unknown }>
+  }
+}
+
+/** V2 capture: native hooks provide session identity and cover both HTTP and WebSocket traffic. */
+const v2 = {
+  id: "ljw1004.opencode-trace",
+  async setup(ctx: TraceContext): Promise<() => void> {
+    const requests = new WeakMap<Request, Trace>()
+    // V2 serializes WebSocket exchanges on one connection per session.
+    const sockets = new Map<string, { url: string; trace?: Trace; frames: Array<{ data: unknown }> }>()
+    const finishSocket = (session: string, reason?: string): void => {
+      const socket = sockets.get(session)
+      if (!socket?.trace) return
+      const last = socket.frames[socket.frames.length - 1]?.data
+      const json = isRecord(last) && isRecord(last.response)
+        ? last.response
+        : isRecord(last) && last.type === "error"
+          ? last
+          : socket.frames.every(({ data }) => isRecord(data) && typeof data.type === "string" && data.type.startsWith("response."))
+            ? openaiResponses(socket.frames)
+            : { _frames: socket.frames.map(({ data }) => data) }
+      socket.trace.json({ ...json, ...(reason ? { _incomplete: reason } : {}) })
+      if (reason) socket.trace.error(reason)
+      delete socket.trace
+      socket.frames = []
+    }
+
+    await ctx.session.hook("http.request", async (event) => {
+      if (event.kind === "primary") finishSocket(event.sessionID, "WebSocket exchange fell back to HTTP")
+      const raw = await readRequest(event.request)
+      requests.set(event.request, startTrace(event.request, event.sessionID, raw, event.kind))
+    })
+    await ctx.session.hook("http.response", (event) => {
+      const trace = requests.get(event.request)
+      if (!trace) return
+      requests.delete(event.request)
+      traceResponse(event.request, event.response, trace)
+    })
+
+    await ctx.session.hook("experimental.ws.handshake", (event) => {
+      finishSocket(event.sessionID, "WebSocket exchange ended before its terminal event")
+      sockets.set(event.sessionID, { url: event.url, frames: [] })
+    })
+    await ctx.session.hook("experimental.ws.send", (event) => {
+      const socket = sockets.get(event.sessionID)
+      if (!socket) return
+      finishSocket(event.sessionID, "WebSocket exchange ended before its terminal event")
+      socket.trace = startTrace({ method: "WS", url: socket.url }, event.sessionID, requestAsJson(event.frame), event.kind)
+    })
+    await ctx.session.hook("experimental.ws.receive", (event) => {
+      const socket = sockets.get(event.sessionID)
+      if (!socket?.trace) return
+      const raw = requestAsJson(event.frame)
+      socket.frames.push({ data: raw })
+      if (raw.type === "response.completed" || raw.type === "response.incomplete" || raw.type === "response.failed" || raw.type === "error") {
+        finishSocket(event.sessionID)
+      }
+    })
+
+    await ctx.session.hook("retry", (event) => {
+      // Retry events have no request identity or kind; don't guess which concurrent exchange failed.
+      writeNoThrow(event.sessionID, event.sessionID, {
+        ...event.error,
         _kind: "error",
-        _ts: now(),
-        ...error(err),
+        _purpose: "[retry]",
+        _ts: new Date().toISOString(),
+        _error: event.error.message,
+        _attempt: event.attempt,
       })
     })
-  return res
+
+    const controller = new AbortController()
+    void (async (): Promise<void> => {
+      for await (const event of ctx.event.subscribe({ signal: controller.signal })) {
+        if (event.type !== "session.idle" || !isRecord(event.data) || typeof event.data.sessionID !== "string") continue
+        finishSocket(event.data.sessionID, "Session ended before the WebSocket response completed")
+        sockets.delete(event.data.sessionID)
+      }
+    })().catch(() => { /* Subscription cancellation must not interrupt OpenCode. */ })
+
+    // OpenCode disposes hook registrations; release our subscription and partial frame buffers too.
+    return (): void => {
+      controller.abort()
+      for (const session of sockets.keys()) finishSocket(session, "Plugin unloaded before the WebSocket response completed")
+      sockets.clear()
+    }
+  },
 }
 
 /* Plugin model:
  * - This module is loaded with dynamic import() when plugin state is initialized for an instance/directory.
  *   The module import is normally cached, so our top-level state like `orig` survives repeated hook initialization
- * - Opencode calls `default.server()` when it initializes this plugin's server hooks for that instance.
+ * - Opencode V1 calls `default.server()` when it initializes this plugin's server hooks for that instance.
  *   This can happen more than once per process across instance reload/dispose, which is why our fetch()
  *   patch is guarded even though the module itself is loaded only once.
- * - Opencode v1.3 has a single unified process for both TUI and server, so its plugin entrypoint `default` is just a function.
- * - Opencode v1.4 has two separate entrypoints, `default.tui()` and `default.server()`
+ * - OpenCode V1 >= 1.18.29 supports this object entrypoint; older releases may require a function export.
+ * - OpenCode V2 calls `default.setup()` to register native transport hooks instead of patching fetch.
  */
-const main: (() => Promise<object>) & {id?: unknown, server?: unknown} = async () => {
+const main = async (): Promise<object> => {
   if (!orig) {
     orig = globalThis.fetch.bind(globalThis);
     globalThis.fetch = tracedFetch;
@@ -637,7 +786,4 @@ const main: (() => Promise<object>) & {id?: unknown, server?: unknown} = async (
   return {};
 };
 
-const entrypoint = main; // opencode v1.3 expects default export to be a function
-entrypoint.id = "ljw1004.opencode-trace";
-entrypoint.server = main; // opencode v1.4 expects default export to be an object, with server() being what executes
-export default entrypoint;
+export default { ...v2, server: main };
